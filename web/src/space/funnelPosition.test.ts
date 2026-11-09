@@ -48,3 +48,24 @@ describe('classifyFunnelPositions', () => {
     expect(out.get(none.ad_id)?.estimated).toBe(true)
   })
 })
+
+describe('classifyFunnelPositions, small groups and shared creatives', () => {
+  it('puts a lone ad with no segment data in the middle, not the bottom', () => {
+    const lone = ad({}, 2, 15)
+    const out = classifyFunnelPositions([lone])
+    expect(out.get(lone.ad_id)?.lane).toBe('MOF')
+    expect(out.get(lone.ad_id)?.estimated).toBe(true)
+  })
+
+  it('averages CPMr and frequency by spend for a creative running as several ads', () => {
+    // One creative in two ad sets: reach overlaps, so it is not summed.
+    const a = { ...ad(ENG, 2, 30), creative_hash: 'shared', spend: 300, reach: 10000 } as Ad
+    const b = { ...ad(ENG, 3, 40), creative_hash: 'shared', spend: 100, reach: 2500, frequency: null, impressions: 7500 } as Ad
+    const out = classifyFunnelPositions([a, b])
+    const p = out.get(a.ad_id)!
+    expect(out.get(b.ad_id)).toBe(p)
+    expect(p.members).toBe(2)
+    expect(p.cpmr).toBeCloseTo(32.5) // (30*300 + 40*100) / 400
+    expect(p.freq).toBeCloseTo(2.25) // missing frequency falls back to impressions / reach = 3
+  })
+})

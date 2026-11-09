@@ -54,8 +54,6 @@ export type FunnelPlacement = {
   /** Spend-weighted frequency of the group. */
   freq: number
   cpmr: number
-  /** Frequency at or above the 75th percentile of the view. */
-  fatigued: boolean
 }
 
 /** CPMr's share of the saturation score; frequency takes the rest. */
@@ -82,9 +80,9 @@ function dominantOf(s: SegSpend): keyof SegSpend {
   return entries[0][1] > 0 ? entries[0][0] : 'unknown'
 }
 
-function quantile(values: number[], p: number): number {
-  if (!values.length) return 0
-  const sorted = [...values].sort((a, b) => a - b)
+/** Quantile of an already sorted list. */
+function sortedQuantile(sorted: number[], p: number): number {
+  if (!sorted.length) return 0
   const idx = (sorted.length - 1) * p
   const lo = Math.floor(idx), hi = Math.ceil(idx)
   if (lo === hi) return sorted[lo]
@@ -109,38 +107,31 @@ export function funnelDedupeKey(ad: AdCreative): string {
  * spend are not placed (absent from the map).
  */
 export function classifyFunnelPositions(ads: AdCreative[]): Map<string, FunnelPlacement> {
-  type G = {
-    rep: AdCreative; seg: SegSpend; repSpend: number
-    spend: number; impr: number; reach: number
-    freqSum: number; freqW: number; ids: string[]
-  }
+  // A creative can run as several ads (one per ad set). Frequency and CPMr are each ad's own, averaged by spend:
+  // reach doesn't add up across ad sets (the same people sit in several), so summing it would understate CPMr
+  // for creatives that run in many places. Ads missing a value don't weigh into its average.
+  type G = { seg: SegSpend; freqSum: number; freqW: number; cpmrSum: number; cpmrW: number; ids: string[] }
   const groups = new Map<string, G>()
   for (const ad of ads) {
-    if (!ad.ad_id || !((Number(ad.spend) || 0) > 0)) continue
+    const spend = Number(ad.spend) || 0
+    if (!ad.ad_id || !(spend > 0)) continue
     const key = funnelDedupeKey(ad)
     const seg = segOf(ad)
-    const segTot = seg.prospecting + seg.engaged + seg.existing + seg.unknown
-    const spend = Number(ad.spend) || segTot
-    const impr = Number(ad.impressions) || 0
     const reach = Number(ad.reach) || 0
-    const freq = Number(ad.frequency) || 0
-    const g = groups.get(key)
+    const freq = Number(ad.frequency) || (reach > 0 ? (Number(ad.impressions) || 0) / reach : 0)
+    const cpmr = reach > 0 ? (spend / reach) * 1000 : 0
+    let g = groups.get(key)
     if (!g) {
-      groups.set(key, {
-        rep: ad, seg: { ...seg }, repSpend: spend,
-        spend, impr, reach,
-        freqSum: freq * spend, freqW: spend, ids: [ad.ad_id],
-      })
-    } else {
-      if (spend > g.repSpend) { g.rep = ad; g.repSpend = spend }
-      g.seg.prospecting += seg.prospecting
-      g.seg.engaged += seg.engaged
-      g.seg.existing += seg.existing
-      g.seg.unknown += seg.unknown
-      g.spend += spend; g.impr += impr; g.reach += reach
-      g.freqSum += freq * spend; g.freqW += spend
-      g.ids.push(ad.ad_id)
+      g = { seg: { prospecting: 0, engaged: 0, existing: 0, unknown: 0 }, freqSum: 0, freqW: 0, cpmrSum: 0, cpmrW: 0, ids: [] }
+      groups.set(key, g)
     }
+    g.seg.prospecting += seg.prospecting
+    g.seg.engaged += seg.engaged
+    g.seg.existing += seg.existing
+    g.seg.unknown += seg.unknown
+    if (freq > 0) { g.freqSum += freq * spend; g.freqW += spend }
+    if (cpmr > 0) { g.cpmrSum += cpmr * spend; g.cpmrW += spend }
+    g.ids.push(ad.ad_id)
   }
 
   type Pre = {
@@ -150,8 +141,8 @@ export function classifyFunnelPositions(ads: AdCreative[]): Map<string, FunnelPl
   const pre: Pre[] = []
   for (const [key, g] of groups) {
     const total = g.seg.prospecting + g.seg.engaged + g.seg.existing + g.seg.unknown
-    const freq = g.freqW > 0 ? g.freqSum / g.freqW : (g.reach > 0 ? g.impr / g.reach : 0)
-    const cpmr = g.reach > 0 ? (g.spend / g.reach) * 1000 : 0
+    const freq = g.freqW > 0 ? g.freqSum / g.freqW : 0
+    const cpmr = g.cpmrW > 0 ? g.cpmrSum / g.cpmrW : 0
     pre.push({ key, ids: g.ids, seg: g.seg, total, dominant: dominantOf(g.seg), freq, cpmr, estimated: total <= 0 })
   }
 
@@ -180,17 +171,22 @@ export function classifyFunnelPositions(ads: AdCreative[]): Map<string, FunnelPl
   for (const b of ['existing', 'engaged', 'new', 'none'] as Bucket[]) {
     ranks.set(b, { freq: sortedBy(b, p => p.freq), cpmr: sortedBy(b, p => p.cpmr) })
   }
-  // Share of values <= v: a binary search (upper bound), so the whole pass
-  // stays O(n log n) for accounts with thousands of creatives.
+  // Mid-rank percentile: share below v plus half the ties, so ranks run evenly
+  // around 0.5 (the old share-at-or-below never reached 0, which pushed lone
+  // and small groups toward the bottom). Binary searches keep it O(n log n).
   const pctRank = (sorted: number[], v: number): number => {
     if (!sorted.length || !(v > 0)) return 0.5
-    let lo = 0, hi = sorted.length
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1
-      if (sorted[mid] <= v) lo = mid + 1
-      else hi = mid
+    const upper = (strict: boolean) => {
+      let lo = 0, hi = sorted.length
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1
+        if (strict ? sorted[mid] < v : sorted[mid] <= v) lo = mid + 1
+        else hi = mid
+      }
+      return lo
     }
-    return lo / sorted.length
+    const below = upper(true), atOrBelow = upper(false)
+    return (below + atOrBelow) / 2 / sorted.length
   }
   const satCache = new Map<Pre, number>()
   const saturation = (p: Pre): number => {
@@ -211,7 +207,7 @@ export function classifyFunnelPositions(ads: AdCreative[]): Map<string, FunnelPl
   //                                    the cold + warm mix)
   //   no measured cohort            -> TOF/MOF/BOF by score tertiles, estimated
   const engSats = pre.filter(p => buckets.get(p) === 'engaged').map(saturation).sort((a, b) => a - b)
-  const engMedian = engSats.length ? quantile(engSats, 0.5) : 0.5
+  const engMedian = engSats.length ? sortedQuantile(engSats, 0.5) : 0.5
   const NEW_MOF_WARMTH = 0.4
 
   const laneOf = (p: Pre): FunnelLane => {
@@ -229,7 +225,6 @@ export function classifyFunnelPositions(ads: AdCreative[]): Map<string, FunnelPl
     return 'BOF'
   }
 
-  const fatigueCut = quantile(pre.map(p => p.freq).filter(f => f > 0), 0.75)
   const out = new Map<string, FunnelPlacement>()
   for (const p of pre) {
     const placement: FunnelPlacement = {
@@ -239,7 +234,6 @@ export function classifyFunnelPositions(ads: AdCreative[]): Map<string, FunnelPl
       members: p.ids.length,
       freq: p.freq,
       cpmr: p.cpmr,
-      fatigued: p.freq > 0 && p.freq >= fatigueCut,
     }
     for (const id of p.ids) out.set(id, placement)
   }

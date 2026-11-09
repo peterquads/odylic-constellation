@@ -10,11 +10,13 @@
 //   BOF    Engaged cohort, higher saturation (hit harder, NOT customers)
 //   REACT  Reactivation = the EXISTING-customer cohort (retention layer)
 //
-// The ENGAGED cohort splits MOF vs BOF by an ACCOUNT-RELATIVE percentile
-// "saturation" score (frequency + CPMr percentile ranks within this view).
-// Ads with no measured cohort (unknown / no segment delivery) are ranged
-// across TOF/MOF/BOF by that same saturation score and flagged `estimated`,
-// so a view can be honest about measured vs inferred placements.
+// Each creative joins the segment that took most of its spend, and is ranked
+// against the other creatives IN THAT SEGMENT by a "saturation" score: its
+// CPMr percentile and frequency percentile within the segment, CPMr weighted
+// twice as heavily. The ENGAGED segment splits MOF vs BOF at its median score.
+// Ads with no measured cohort (no segment delivery, or Unknown is the biggest
+// share) are ranked among themselves, ranged across TOF/MOF/BOF by score and
+// flagged `estimated`, so a view is honest about measured vs inferred.
 //
 // Absolute frequency / CPMr numbers are never used (a frequency of 3 means
 // fatigue for cold traffic but health for warm), only percentile ranks.
@@ -55,6 +57,9 @@ export type FunnelPlacement = {
   /** Frequency at or above the 75th percentile of the view. */
   fatigued: boolean
 }
+
+/** CPMr's share of the saturation score; frequency takes the rest. */
+const CPMR_WEIGHT = 2 / 3
 
 type SegSpend = { prospecting: number; engaged: number; existing: number; unknown: number }
 
@@ -150,10 +155,31 @@ export function classifyFunnelPositions(ads: AdCreative[]): Map<string, FunnelPl
     pre.push({ key, ids: g.ids, seg: g.seg, total, dominant: dominantOf(g.seg), freq, cpmr, estimated: total <= 0 })
   }
 
-  // Percentile position within THIS view, combined into a 0..1 saturation
-  // score. Higher = hit harder relative to peers.
-  const freqSorted = pre.map(p => p.freq).filter(f => f > 0).sort((a, b) => a - b)
-  const cpmrSorted = pre.map(p => p.cpmr).filter(c => c > 0).sort((a, b) => a - b)
+  // SHARE-BASED cohort on the measured axis only (unknown is off-axis).
+  type Bucket = 'existing' | 'engaged' | 'new' | 'none'
+  const cohortShares = (p: Pre): { pr: number; en: number; ex: number } | null => {
+    const t = p.seg.prospecting + p.seg.engaged + p.seg.existing
+    if (t <= 0) return null
+    return { pr: p.seg.prospecting / t, en: p.seg.engaged / t, ex: p.seg.existing / t }
+  }
+  const bucketOf = (p: Pre): Bucket => {
+    const sh = p.estimated || p.dominant === 'unknown' ? null : cohortShares(p)
+    if (!sh) return 'none'
+    if (sh.ex >= sh.pr && sh.ex >= sh.en && sh.ex > 0) return 'existing'
+    if (sh.en > sh.pr && sh.en >= sh.ex && sh.en > 0) return 'engaged'
+    return 'new'
+  }
+  const buckets = new Map<Pre, Bucket>()
+  for (const p of pre) buckets.set(p, bucketOf(p))
+
+  // Percentile position within the creative's OWN segment, combined into a
+  // 0..1 saturation score. Higher = hit harder than its segment peers.
+  const sortedBy = (b: Bucket, f: (p: Pre) => number): number[] =>
+    pre.filter(p => buckets.get(p) === b).map(f).filter(v => v > 0).sort((a, c) => a - c)
+  const ranks = new Map<Bucket, { freq: number[]; cpmr: number[] }>()
+  for (const b of ['existing', 'engaged', 'new', 'none'] as Bucket[]) {
+    ranks.set(b, { freq: sortedBy(b, p => p.freq), cpmr: sortedBy(b, p => p.cpmr) })
+  }
   // Share of values <= v: a binary search (upper bound), so the whole pass
   // stays O(n log n) for accounts with thousands of creatives.
   const pctRank = (sorted: number[], v: number): number => {
@@ -166,72 +192,49 @@ export function classifyFunnelPositions(ads: AdCreative[]): Map<string, FunnelPl
     }
     return lo / sorted.length
   }
-  // Each group's score, computed once (the lane passes below read it 2 to 4 times).
   const satCache = new Map<Pre, number>()
   const saturation = (p: Pre): number => {
     let s = satCache.get(p)
     if (s === undefined) {
-      s = (pctRank(freqSorted, p.freq) + pctRank(cpmrSorted, p.cpmr)) / 2
+      const r = ranks.get(buckets.get(p)!)!
+      s = CPMR_WEIGHT * pctRank(r.cpmr, p.cpmr) + (1 - CPMR_WEIGHT) * pctRank(r.freq, p.freq)
       satCache.set(p, s)
     }
     return s
   }
 
-  // No cohort signal: range across TOF/MOF/BOF by saturation tertiles.
-  const rangeBySaturation = (p: Pre): FunnelLane => {
+  //   existing is the top cohort    -> REACTIVATION
+  //   engaged is the top cohort     -> MOF vs BOF, split at the MEDIAN score of
+  //                                    the engaged segment
+  //   prospecting is the top cohort -> TOF, or MOF when the audience already
+  //                                    skews warm (engaged >= NEW_MOF_WARMTH of
+  //                                    the cold + warm mix)
+  //   no measured cohort            -> TOF/MOF/BOF by score tertiles, estimated
+  const engSats = pre.filter(p => buckets.get(p) === 'engaged').map(saturation).sort((a, b) => a - b)
+  const engMedian = engSats.length ? quantile(engSats, 0.5) : 0.5
+  const NEW_MOF_WARMTH = 0.4
+
+  const laneOf = (p: Pre): FunnelLane => {
+    const b = buckets.get(p)!
+    if (b === 'existing') return 'REACT'
+    if (b === 'engaged') return saturation(p) >= engMedian ? 'BOF' : 'MOF'
+    if (b === 'new') {
+      const sh = cohortShares(p)!
+      const pe = sh.pr + sh.en
+      return pe > 0 && sh.en / pe >= NEW_MOF_WARMTH ? 'MOF' : 'TOF'
+    }
     const s = saturation(p)
     if (s < 1 / 3) return 'TOF'
     if (s < 2 / 3) return 'MOF'
     return 'BOF'
   }
 
-  // SHARE-BASED placement on the cohort axis only (unknown is off-axis).
-  const cohortShares = (p: Pre): { pr: number; en: number; ex: number } | null => {
-    const t = p.seg.prospecting + p.seg.engaged + p.seg.existing
-    if (t <= 0) return null
-    return { pr: p.seg.prospecting / t, en: p.seg.engaged / t, ex: p.seg.existing / t }
-  }
-  const warmthOf = (sh: { pr: number; en: number }): number => {
-    const pe = sh.pr + sh.en
-    return pe > 0 ? sh.en / pe : 0
-  }
-  const isExistingTop = (sh: { pr: number; en: number; ex: number }) =>
-    sh.ex >= sh.pr && sh.ex >= sh.en && sh.ex > 0
-  const isEngagedTop = (sh: { pr: number; en: number; ex: number }) =>
-    sh.en > sh.pr && sh.en >= sh.ex && sh.en > 0
-
-  //   existing is the top cohort   -> REACTIVATION
-  //   engaged is the top cohort    -> MOF vs BOF, split at the MEDIAN saturation
-  //                                   among engaged-dominant creatives (relative,
-  //                                   so BOF always populates when they exist)
-  //   prospecting is the top cohort -> TOF, or MOF when the audience already
-  //                                   skews warm (engaged >= NEW_MOF_WARMTH of
-  //                                   the cold + warm mix)
-  const engSats = pre
-    .filter(p => {
-      if (p.estimated || p.dominant === 'unknown') return false
-      const sh = cohortShares(p)
-      return !!sh && isEngagedTop(sh)
-    })
-    .map(saturation).sort((a, b) => a - b)
-  const engMedian = engSats.length ? quantile(engSats, 0.5) : 0.5
-  const NEW_MOF_WARMTH = 0.4
-
-  const laneForMeasured = (p: Pre): FunnelLane => {
-    if (p.dominant === 'unknown') return rangeBySaturation(p)
-    const sh = cohortShares(p)
-    if (!sh) return rangeBySaturation(p)
-    if (isExistingTop(sh)) return 'REACT'
-    if (isEngagedTop(sh)) return saturation(p) >= engMedian ? 'BOF' : 'MOF'
-    return warmthOf(sh) >= NEW_MOF_WARMTH ? 'MOF' : 'TOF'
-  }
-
   const fatigueCut = quantile(pre.map(p => p.freq).filter(f => f > 0), 0.75)
   const out = new Map<string, FunnelPlacement>()
   for (const p of pre) {
     const placement: FunnelPlacement = {
-      lane: p.estimated ? rangeBySaturation(p) : laneForMeasured(p),
-      estimated: p.estimated,
+      lane: laneOf(p),
+      estimated: buckets.get(p) === 'none',
       key: p.key,
       members: p.ids.length,
       freq: p.freq,

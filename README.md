@@ -51,10 +51,13 @@ user alone.
 
 ## What you can do
 
-- **Funnel position**, the default view. Each ad's spend is split by Meta's own customer segments:
-  prospecting (top of funnel), engaged (middle and bottom, split by how hard the account is
-  hitting them), and existing customers (reactivation). Ads with no segment data are placed from
-  frequency and cost per reach, drawn dashed so you know which is which.
+- **Funnel position**, the default view. Each ad's spend is split by Meta's own customer segments,
+  and the ad joins the segment that took most of it: prospecting (top of funnel), engaged (middle
+  and bottom) or existing customers (reactivation). Each ad is ranked only against the other ads in
+  its segment, by cost per 1,000 reached (two thirds of the score) and frequency (one third). The
+  engaged ads that score above their segment's median go to the bottom of the funnel. Ads with no
+  segment data, or mostly Unknown delivery, are ranked among themselves and drawn dashed so you
+  know which is which.
 - **Your naming convention.** The app reads your ad names and picks out the fields on its own:
   funnel stage, angle, persona, format, hook, creator, version and so on. Underscore, dash, pipe
   and `KEY:value` styles all work, mixed in one account too.
